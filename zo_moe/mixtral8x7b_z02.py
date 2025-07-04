@@ -17,6 +17,7 @@ from zo2 import ZOConfig
 from zo2.model.base import BaseZOModel
 from zo2.optimizer.mezo_sgd.zo2 import MeZO2SGD
 from zo2.config.mezo_sgd import MeZOSGDConfig
+from zo2.utils import seed_everything
 
 # 从transformers导入Mixtral相关组件
 from transformers.models.mixtral.modeling_mixtral import (
@@ -537,56 +538,18 @@ class MixtralZO2Optimizer(MeZO2SGD):
 
 # ======================= ZO2 Mixtral模型 =======================
 
-class ZO2MixtralForCausalLM(BaseZOModel):
+class ZO2MixtralForCausalLM(MixtralForCausalLM, BaseZOModel):
     """
     集成ZO2优化的Mixtral因果语言模型
     """
     
-    def __init__(self, config: MixtralConfig):
-        # 首先初始化标准的Mixtral模型
-        self.model = MixtralForCausalLM(config)
-        
-        # 初始化BaseZOModel
-        BaseZOModel.__init__(self)
-        
-        # 存储配置，稍后初始化ZO2优化器
-        self.config = config
-        self.zo_config = None
-        self.opt = None
-        
-        print(f"ZO2MixtralForCausalLM initialized with {config.num_local_experts} experts")
-    
-    def init_zo2_optimizer(self, zo_config: MeZOSGDConfig):
-        """初始化ZO2优化器"""
-        self.zo_config = zo_config
-        self.opt = MixtralZO2Optimizer(model=self, config=zo_config)
-        print("ZO2 optimizer initialized")
-    
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, zo_config: MeZOSGDConfig = None, **kwargs):
-        """
-        从预训练模型加载并初始化ZO2版本
-        """
-        print(f"Loading pretrained model from {pretrained_model_name_or_path}")
-        
-        # 首先加载标准的Mixtral模型
-        standard_model = MixtralForCausalLM.from_pretrained(
-            pretrained_model_name_or_path, 
-            **kwargs
-        )
-        
-        # 创建ZO2版本的模型
-        zo2_model = cls(standard_model.config)
-        
-        # 复制权重
-        zo2_model.model.load_state_dict(standard_model.state_dict())
-        
-        # 如果提供了zo_config，初始化ZO2优化器
-        if zo_config is not None:
-            zo2_model.init_zo2_optimizer(zo_config)
-        
-        print("✓ ZO2 model loaded from pretrained successfully")
-        return zo2_model
+    def __init__(self, config: MixtralConfig, zo_config: MeZOSGDConfig):
+        super().__init__(config)
+        #self.opt = MixtralZO2Optimizer(model=self, config=zo_config)
+
+    def zo_init(self, zo_config: MeZOSGDConfig):
+        """手动初始化ZO2优化器"""
+        self.opt = MixtralZO2Optimizer(model=self, config=zo_config)         
     
     def forward(
         self,
@@ -606,7 +569,7 @@ class ZO2MixtralForCausalLM(BaseZOModel):
         """
         前向传播，根据训练模式选择ZO2或常规前向传播
         """
-        if self.zo_training and self.opt is not None:
+        if self.zo_training:
             # ZO2训练模式
             return self.opt.zo_forward(
                 input_ids=input_ids,
@@ -624,7 +587,7 @@ class ZO2MixtralForCausalLM(BaseZOModel):
             )
         else:
             # 标准前向传播
-            return self.model.forward(
+            return self.opt.inner_zo_eval_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -638,136 +601,55 @@ class ZO2MixtralForCausalLM(BaseZOModel):
                 cache_position=cache_position,
                 **kwargs
             )
-    
-    def __getattr__(self, name):
-        """代理到内部模型的属性访问"""
-        if name in ['model', 'config', 'zo_config', 'opt', 'zo_training']:
-            return super().__getattribute__(name)
-        return getattr(self.model, name)
 
 
-# ======================= 配置和工厂函数 =======================
 
-@dataclass
-class MixtralZO2Config:
-    """Mixtral ZO2特定配置"""
-    # 模型配置
-    model_name: str = "mixtral-8x7b"
-    
-    # ZO2配置
-    zo2: bool = True
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-1
-    zo_eps: float = 1e-3
-    
-    # 设备配置
-    working_device: str = "cuda:0"
-    offloading_device: str = "cpu"
-    
-    # 内存优化
-    offloading_blocks: Optional[List[int]] = None
-    overlap: bool = True
-    
-    # 精度配置
-    amp: bool = False
-    amp_precision: torch.dtype = torch.float16
-    precision_on_working_device: torch.dtype = torch.float32
-    precision_on_offloading_device: torch.dtype = torch.float16
-    
-    # 优化方法
-    compute_module_optimize_method: str = ""
-    compute_function_optimize_method: str = ""
-    communicate_optimize_method: str = ""
-    
-    # MoE特定配置
-    expert_parallel: bool = False  # 是否并行处理experts
-    selective_expert_training: bool = True  # 是否只训练选中的experts
+# main
+if __name__ == "__main__":
+    # Hyperparameter
+    zo_method = "zo2"
+    eval_mode = False
+    model_name = "mixtral-8x7b"
+    verbose = True
+    max_steps = 300
+    learning_rate = 1e-7
+    weight_decay = 1e-1
+    zo_eps = 1e-3
+    seed = 42
+    offloading_device = "cpu"
+    working_device = "cuda:0"
+    max_train_data = None
+    max_eval_data = None
+    use_cache = True
+    max_new_tokens = 50
+    temperature = 1.0
+    seed_everything(seed)
 
-
-def create_zo2_mixtral_model(
-    pretrained_model_path: str,
-    zo2_config: MixtralZO2Config,
-    **kwargs
-) -> ZO2MixtralForCausalLM:
-    """
-    创建ZO2 Mixtral模型的工厂函数
-    
-    Args:
-        pretrained_model_path: 预训练模型路径
-        zo2_config: ZO2优化配置
-        **kwargs: 传递给from_pretrained的额外参数
-    
-    Returns:
-        ZO2MixtralForCausalLM: 配置好的ZO2 Mixtral模型
-    """
-    
-    # 转换为MeZOSGDConfig
-    mezo_config = MeZOSGDConfig(
-        zo_method="mezo-sgd",
-        zo2=zo2_config.zo2,
-        lr=zo2_config.learning_rate,
-        weight_decay=zo2_config.weight_decay,
-        eps=zo2_config.zo_eps,
-        working_device=zo2_config.working_device,
-        offloading_device=zo2_config.offloading_device,
-        offloading_blocks=zo2_config.offloading_blocks,
-        overlap=zo2_config.overlap,
-        amp=zo2_config.amp,
-        amp_precision=zo2_config.amp_precision,
-        precision_on_working_device=zo2_config.precision_on_working_device,
-        precision_on_offloading_device=zo2_config.precision_on_offloading_device,
-        compute_module_optimize_method=zo2_config.compute_module_optimize_method,
-        compute_function_optimize_method=zo2_config.compute_function_optimize_method,
-        communicate_optimize_method=zo2_config.communicate_optimize_method
+    # ZO steps
+    zo_config = ZOConfig(
+        method="mezo-sgd", 
+        zo2=zo_method=="zo2", 
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        eps=zo_eps,
+        offloading_device=offloading_device,
+        working_device=working_device,
     )
-    
-    # 创建模型
+
+    # 直接使用ZO2模型的from_pretrained，传入zo_config
     model = ZO2MixtralForCausalLM.from_pretrained(
-        pretrained_model_path,
-        zo_config=mezo_config,
-        **kwargs
+        "/data2/fhe/models/Mixtral-8x7B-v0.1",
+        zo_config=zo_config,
+        torch_dtype=torch.float16,
+        device_map="cpu"
     )
-    
-    return model
 
+    print("Initializing ZO2...")
+    # 模型加载完成后初始化ZO2
+    model.zo_init(zo_config)    
 
-# ======================= 使用示例 =======================
+    print(f"Check if zo2 init correctly: {hasattr(model, 'zo_training')}")
 
-def example_usage():
-    """使用示例"""
-    
-    # 检查设备
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    # 创建ZO2配置
-    zo2_config = MixtralZO2Config(
-        model_name="mixtral-8x7b",
-        zo2=True,
-        learning_rate=1e-4,
-        weight_decay=1e-1,
-        zo_eps=1e-3,
-        working_device=device,
-        offloading_device="cpu",
-        offloading_blocks=list(range(16, 32)),  # 后半部分层卸载到CPU
-        overlap=True,
-        amp=False,
-        selective_expert_training=True
-    )
-    
-    # 创建模型
-    try:
-        print("Creating ZO2 Mixtral model...")
-        model = create_zo2_mixtral_model(
-            pretrained_model_path="/data2/fhe/models/Mixtral-8x7B-v0.1",
-            zo2_config=zo2_config,
-            device_map="auto",
-            torch_dtype=torch.float16
-        )
-        print("✓ Model created successfully")
-    except Exception as e:
-        print(f"✗ Error creating model: {e}")
-        return
     
     # 准备训练数据
     batch_size = 1
@@ -792,10 +674,5 @@ def example_usage():
             print(f"Step {step + 1}, Loss: {loss.item():.4f}")
     except Exception as e:
         print(f"✗ Error during training: {e}")
-        return
     
     print("✓ ZO2 Mixtral training completed!")
-
-
-if __name__ == "__main__":
-    example_usage()
