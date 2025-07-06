@@ -122,8 +122,8 @@ class MixtralZO2Optimizer(MeZO2SGD):
         if inputs_embeds is None:
             inputs_embeds1, inputs_embeds2 = self.task_compute_module(
                 self.model.model.embed_tokens,
-                inputs1={"input_ids": input_ids},
-                inputs2={"input_ids": input_ids},
+                inputs1={"input": input_ids},
+                inputs2={"input": input_ids},
                 grad=self.projected_grad
             )
         else:
@@ -427,6 +427,8 @@ class MixtralZO2Optimizer(MeZO2SGD):
         """
         只对选中的experts进行ZO2计算
         """
+        # 确保是所有张量都在同一个设备上
+        device = hidden_states1.device
         batch_size, seq_len, hidden_dim = hidden_states1.shape
         hidden_states1_flat = hidden_states1.view(-1, hidden_dim)
         hidden_states2_flat = hidden_states2.view(-1, hidden_dim)
@@ -434,10 +436,14 @@ class MixtralZO2Optimizer(MeZO2SGD):
         final_output1 = torch.zeros_like(hidden_states1_flat)
         final_output2 = torch.zeros_like(hidden_states2_flat)
         
-        # 创建expert mask
+        # 确保选择的专家索引和路由权重在正确的设备上
+        selected_experts = selected_experts.to(device)
+        routing_weights = routing_weights.to(device)
+
+        # 创建expert mask并确保在正确的设备上
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=len(experts)
-        ).permute(2, 1, 0)
+        ).permute(2, 1, 0).to(device)
         
         # 只处理被选中的experts
         for expert_idx in range(len(experts)):
@@ -460,7 +466,7 @@ class MixtralZO2Optimizer(MeZO2SGD):
                     )
                     
                     # 应用routing权重
-                    weights = routing_weights[token_indices]
+                    weights = routing_weights[token_indices].to(device)
                     expert_output1 = expert_output1 * weights.unsqueeze(-1)
                     expert_output2 = expert_output2 * weights.unsqueeze(-1)
                     
@@ -659,7 +665,7 @@ if __name__ == "__main__":
     print(f"Preparing training data: batch_size={batch_size}, seq_len={seq_len}")
     
     # 随机生成输入数据用于测试
-    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len + 1))
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len + 1)).to(working_device)
     inputs = input_ids[:, :-1]
     labels = input_ids[:, 1:]
     
