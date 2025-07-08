@@ -4,6 +4,7 @@ import sys
 sys.path.append("../")
 
 from transformers import MixtralForCausalLM, MixtralConfig
+from transformers import PretrainedConfig
 from pathlib import Path
 
 import torch
@@ -60,6 +61,24 @@ def get_hidden_states_from_outputs(outputs):
     else:
         return outputs
 
+def init_all_hidden_states(output_hidden_states):
+    return () if output_hidden_states else None
+
+def init_all_self_attns(output_attentions):
+    return () if output_attentions else None
+
+def init_next_decoder_cache(use_cache):
+    return () if use_cache else None    
+
+def update_all_hidden_states(output_hidden_states, all_hidden_states, hidden_states):
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+    return all_hidden_states    
+
+def fn_get_opt_decoder_hidden_states_from_layer_outputs(input):
+    return input[0]
+
+
 # ======================= MixtralZO2 优化器 =======================
 
 class MixtralZO2Optimizer(MeZO2SGD):
@@ -72,6 +91,9 @@ class MixtralZO2Optimizer(MeZO2SGD):
         """初始化上传关键组件到GPU"""
         print("Upload embeddings and head to cuda...")
         
+        # [Todo] put in a better place
+        self.model.model.projected_grad = None
+
         # 上传embedding层
         self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
         
@@ -117,49 +139,80 @@ class MixtralZO2Optimizer(MeZO2SGD):
         MixtralZO2的前向传播实现
         返回两个损失值用于梯度估计
         """
+        output_attentions = output_attentions if output_attentions is not None else self.model.config.output_attentions
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.model.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.model.config.use_cache
         
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+
         # 1. 处理输入embedding
+        print("Processing inputs_embeds.")
         if inputs_embeds is None:
-            inputs_embeds1, inputs_embeds2 = self.task_compute_module(
-                self.model.model.embed_tokens,
-                inputs1={"input": input_ids},
-                inputs2={"input": input_ids},
-                grad=self.projected_grad
-            )
+            inputs_embeds1, inputs_embeds2 = self.task_compute_module(self.model.model.embed_tokens, 
+                                                     inputs1={"input": input_ids},
+                                                     inputs2={"input": input_ids},
+                                                     grad=self.projected_grad)
         else:
-            inputs_embeds1 = inputs_embeds2 = inputs_embeds
+            inputs_embeds1 = inputs_embeds2 = inputs_embeds        
+        print("Processing inputs_embeds completed.")
+
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds1.shape[1], device=inputs_embeds1.device
+            )
         
-        # 2. 计算位置编码
+        # [Todo]:Correct?
         if position_ids is None:
-            batch_size, seq_len = inputs_embeds1.shape[:2]
-            position_ids = torch.arange(seq_len, device=inputs_embeds1.device).unsqueeze(0).expand(batch_size, -1)
-        
-        # 获取旋转位置编码
-        position_embeddings1, position_embeddings2 = self.task_compute_module(
-            self.model.model.rotary_emb,
-            inputs1={"x": inputs_embeds1, "position_ids": position_ids},
-            inputs2={"x": inputs_embeds2, "position_ids": position_ids},
-            grad=self.projected_grad,
-            compute_sync=False
-        )
-        
-        # 3. 处理注意力掩码
-        if attention_mask is None:
-            batch_size, seq_len = inputs_embeds1.shape[:2]
-            attention_mask = torch.ones(batch_size, seq_len, device=inputs_embeds1.device)
-        
+            position_ids = cache_position.unsqueeze(0)
+
+        # 同一个position_ids用于两个路径
+        position_ids1 = position_ids
+        position_ids2 = position_ids            
+
+        print("Creating causal_mask.")
         # 创建因果掩码
+        # causal_mask = mask_function(
+        #     config=self.config,
+        #     input_embeds=inputs_embeds,
+        #     attention_mask=attention_mask,
+        #     cache_position=cache_position,
+        #     past_key_values=past_key_values,
+        #     position_ids=position_ids,
+        # )
         causal_mask1, causal_mask2 = self.task_compute_function(
-            self._create_causal_mask,
-            inputs1={"attention_mask": attention_mask, "input_shape": inputs_embeds1.shape},
-            inputs2={"attention_mask": attention_mask, "input_shape": inputs_embeds2.shape},
-            compute_sync=False
-        )
-        
-        # 4. 初始化隐藏状态
-        hidden_states1, hidden_states2 = inputs_embeds1, inputs_embeds2
-        
-        # 5. 上传第一层decoder
+            self.model.model._update_causal_mask,
+            inputs1={"input_tensor": inputs_embeds1, "attention_mask": attention_mask, "cache_position": cache_position, 
+                     "past_key_values": past_key_values, "output_attentions": output_attentions},
+            inputs2={"input_tensor": inputs_embeds2, "attention_mask": attention_mask, "cache_position": cache_position, 
+                     "past_key_values": past_key_values, "output_attentions": output_attentions}
+        )   
+        print("Completed causal_mask.")
+
+        hidden_states1 = inputs_embeds1
+        hidden_states2 = inputs_embeds2
+
+        print("Creating position_embeddings.")
+        # 获取旋转位置编码
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # self.model.model?
+        position_embeddings1, position_embeddings2 = self.task_compute_module(self.model.model.rotary_emb,
+                                            inputs1={"x": hidden_states1, "position_ids": position_ids},
+                                            inputs2={"x": hidden_states2, "position_ids": position_ids},
+                                            grad=self.projected_grad,
+                                            compute_sync=False)        
+        print("Completed position_embeddings.")
+
+        # MixtralDecoderLayer
+        # 上传第一层decoder
         if 0 in self.offloading_blocks:
             self.model.model.layers[0] = self.task_upload(
                 module=self.model.model.layers[0],
@@ -174,18 +227,25 @@ class MixtralZO2Optimizer(MeZO2SGD):
                 self.model.model.layers[i-2] = self.task_offload(
                     module=self.model.model.layers[i-2],
                     device=self.offloading_device
-                )
+                )           
             
+            #[Todo]: task_compute_module
             # 计算当前层
-            hidden_states1, hidden_states2 = self.task_compute_decoder_layer(
-                layer=self.model.model.layers[i-1],
-                hidden_states1=hidden_states1,
-                hidden_states2=hidden_states2,
-                attention_mask=causal_mask1,  # 两个mask应该相同
-                position_embeddings=position_embeddings1,  # 位置编码也相同
-                grad=self.projected_grad,
-                output_router_logits=output_router_logits
-            )
+            layer_outputs1, layer_outputs2 = self.task_compute_module(
+                self.model.model.layers[i-1],
+                input1={"hidden_states": hidden_states1, "attention_mask": causal_mask1, 
+                            "position_ids": position_ids1, "output_attentions": output_attentions},
+                input2={"hidden_states": hidden_states2, "attention_mask": causal_mask2, 
+                            "position_ids": position_ids2, "output_attentions": output_attentions},
+                grad=self.projected_grad)
+
+            # hidden_states = layer_outputs[0]
+            hidden_states1, hidden_states2 = self.task_compute_function(
+                fn=fn_get_opt_decoder_hidden_states_from_layer_outputs,
+                inputs1={"input": layer_outputs1},
+                inputs2={"input": layer_outputs2},
+                compute_sync=False
+            )            
             
             # 上传下一层
             if i in self.offloading_blocks:
@@ -202,16 +262,21 @@ class MixtralZO2Optimizer(MeZO2SGD):
             )
         
         # 计算最后一层
-        hidden_states1, hidden_states2 = self.task_compute_decoder_layer(
-            layer=self.model.model.layers[N-1],
-            hidden_states1=hidden_states1,
-            hidden_states2=hidden_states2,
-            attention_mask=causal_mask1,
-            position_embeddings=position_embeddings1,
-            grad=self.projected_grad,
-            output_router_logits=output_router_logits
+        layer_outputs1, layer_outputs2 = self.task_compute_module(
+            self.model.model.layers[N-1],
+            input1={"hidden_states": hidden_states1, "attention_mask": causal_attention_mask1, 
+                        "position_ids": position_ids1, "output_attentions": output_attentions},
+            input2={"hidden_states": hidden_states2, "attention_mask": causal_attention_mask2, 
+                        "position_ids": position_ids2, "output_attentions": output_attentions},
+            grad=self.projected_grad)
+
+        hidden_states1, hidden_states2 = self.task_compute_function(
+            fn=fn_get_opt_decoder_hidden_states_from_layer_outputs,
+            inputs1={"input": layer_outputs1},
+            inputs2={"input": layer_outputs2},
+            compute_sync=False
         )
-        
+
         # 卸载最后一层
         if N-1 in self.offloading_blocks:
             self.model.model.layers[N-1] = self.task_offload(
@@ -227,7 +292,8 @@ class MixtralZO2Optimizer(MeZO2SGD):
             grad=self.projected_grad,
             weight_decay=0.0  # 通常LayerNorm不应用weight decay
         )
-        
+        # For the decoder, now tasks have been done, hidden_state1 and hidden states are outputs.
+
         # 9. 语言模型头
         logits1, logits2 = self.task_compute_module(
             self.model.lm_head,
@@ -487,18 +553,6 @@ class MixtralZO2Optimizer(MeZO2SGD):
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         return routing_weights.to(gate_logits.dtype), selected_experts
     
-    def _create_causal_mask(self, attention_mask, input_shape):
-        """创建因果注意力掩码"""
-        batch_size, seq_len = input_shape[:2]
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attention_mask.device))
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
-        
-        if attention_mask is not None:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            causal_mask = causal_mask * attention_mask
-        
-        return causal_mask
-    
     @torch.inference_mode()
     def inner_zo_eval_forward(
         self,
@@ -646,7 +700,7 @@ if __name__ == "__main__":
     model = ZO2MixtralForCausalLM.from_pretrained(
         "/data2/fhe/models/Mixtral-8x7B-v0.1",
         zo_config=zo_config,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map="cpu"
     )
 
@@ -673,12 +727,19 @@ if __name__ == "__main__":
     print("Starting ZO2 training...")
     model.zo_train()  # 设置为ZO2训练模式
     
-    try:
-        for step in range(3):  # 少量步骤测试
-            print(f"Step {step + 1}/3...")
-            loss = model(input_ids=inputs, labels=labels)
-            print(f"Step {step + 1}, Loss: {loss.item():.4f}")
-    except Exception as e:
-        print(f"✗ Error during training: {e}")
+    # try:
+    #     for step in range(3):  # 少量步骤测试
+    #         print(f"Step {step + 1}/3...")
+    #         loss = model(input_ids=inputs, labels=labels)
+    #         print(f"Step {step + 1}, Loss: {loss.item():.4f}")
+    # except Exception as e:
+    #     print(f"✗ Error during training: {e}")
     
-    print("✓ ZO2 Mixtral training completed!")
+    # print("✓ ZO2 Mixtral training completed!")
+
+    for step in range(3):  # 少量步骤测试
+        print(f"Step {step + 1}/3...")
+        loss = model(input_ids=inputs, labels=labels)
+        print(f"Step {step + 1}, Loss: {loss.item():.4f}")
+    
+    # print("✓ ZO2 Mixtral training completed!")
