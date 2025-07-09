@@ -161,7 +161,7 @@ class MixtralZO2Optimizer(MeZO2SGD):
                                                      grad=self.projected_grad)
         else:
             inputs_embeds1 = inputs_embeds2 = inputs_embeds        
-        print("Processing inputs_embeds completed.")
+        print("Complete Processing inputs_embeds .")
 
 
         if cache_position is None:
@@ -212,6 +212,7 @@ class MixtralZO2Optimizer(MeZO2SGD):
         print("Completed position_embeddings.")
 
         # MixtralDecoderLayer
+        # [Todo*:Offload logic]
         # 上传第一层decoder
         if 0 in self.offloading_blocks:
             self.model.model.layers[0] = self.task_upload(
@@ -233,10 +234,16 @@ class MixtralZO2Optimizer(MeZO2SGD):
             # 计算当前层
             layer_outputs1, layer_outputs2 = self.task_compute_module(
                 self.model.model.layers[i-1],
-                input1={"hidden_states": hidden_states1, "attention_mask": causal_mask1, 
-                            "position_ids": position_ids1, "output_attentions": output_attentions},
-                input2={"hidden_states": hidden_states2, "attention_mask": causal_mask2, 
-                            "position_ids": position_ids2, "output_attentions": output_attentions},
+                inputs1={"hidden_states": hidden_states1, 
+                         "attention_mask": causal_mask1, 
+                         "position_embeddings": position_embeddings1,
+                         "position_ids": position_ids1, 
+                         "output_attentions": output_attentions},
+                inputs2={"hidden_states": hidden_states2,
+                         "attention_mask": causal_mask2, 
+                         "position_embeddings": position_embeddings2,
+                         "position_ids": position_ids2,
+                         "output_attentions": output_attentions},
                 grad=self.projected_grad)
 
             # hidden_states = layer_outputs[0]
@@ -264,11 +271,17 @@ class MixtralZO2Optimizer(MeZO2SGD):
         # 计算最后一层
         layer_outputs1, layer_outputs2 = self.task_compute_module(
             self.model.model.layers[N-1],
-            input1={"hidden_states": hidden_states1, "attention_mask": causal_attention_mask1, 
-                        "position_ids": position_ids1, "output_attentions": output_attentions},
-            input2={"hidden_states": hidden_states2, "attention_mask": causal_attention_mask2, 
-                        "position_ids": position_ids2, "output_attentions": output_attentions},
-            grad=self.projected_grad)
+                inputs1={"hidden_states": hidden_states1, 
+                         "attention_mask": causal_mask1, 
+                         "position_embeddings": position_embeddings1,
+                         "position_ids": position_ids1, 
+                         "output_attentions": output_attentions},
+                inputs2={"hidden_states": hidden_states2,
+                         "attention_mask": causal_mask2, 
+                         "position_embeddings": position_embeddings2,
+                         "position_ids": position_ids2,
+                         "output_attentions": output_attentions},
+                grad=self.projected_grad)
 
         hidden_states1, hidden_states2 = self.task_compute_function(
             fn=fn_get_opt_decoder_hidden_states_from_layer_outputs,
@@ -285,6 +298,7 @@ class MixtralZO2Optimizer(MeZO2SGD):
             )
         
         # 8. 最终层归一化
+        # hidden_states = self.norm(hidden_states)
         hidden_states1, hidden_states2 = self.task_compute_module(
             self.model.model.norm,
             inputs1={"hidden_states": hidden_states1},
@@ -295,46 +309,63 @@ class MixtralZO2Optimizer(MeZO2SGD):
         # For the decoder, now tasks have been done, hidden_state1 and hidden states are outputs.
 
         # 9. 语言模型头
+        # slice_indices
+        # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # logits1, logits2 = self.task_compute_module(
+        #     self.model.lm_head(hidden_states[:, slice_indices, :]),
+        #     inputs1={"input": hidden_states1},
+        #     inputs2={"input": hidden_states2},
+        #     grad=self.projected_grad
+        # )
         logits1, logits2 = self.task_compute_module(
             self.model.lm_head,
-            inputs1={"hidden_states": hidden_states1},
-            inputs2={"hidden_states": hidden_states2},
+            inputs1={"input": hidden_states1},
+            inputs2={"input": hidden_states2},
             grad=self.projected_grad
-        )
+        )        
         
         # 10. 计算损失
         if labels is not None:
             # 计算语言模型损失
-            shift_logits1, shift_logits2 = self.task_compute_function(
-                get_shift_logits,
-                inputs1={"logits": logits1},
-                inputs2={"logits": logits2}
-            )
+            # [Todo*: Don't know why zo2 has shift logits]
+            # shift_logits1, shift_logits2 = self.task_compute_function(
+            #     get_shift_logits,
+            #     inputs1={"logits": logits1},
+            #     inputs2={"logits": logits2}
+            # )
             
-            shift_labels1, shift_labels2 = self.task_compute_function(
-                get_shift_labels,
-                inputs1={"labels": labels},
-                inputs2={"labels": labels}
-            )
+            # shift_labels1, shift_labels2 = self.task_compute_function(
+            #     get_shift_labels,
+            #     inputs1={"labels": labels},
+            #     inputs2={"labels": labels}
+            # )
             
+            # loss1, loss2 = self.task_compute_function(
+            #     F.cross_entropy,
+            #     inputs1={
+            #         "input": shift_logits1.view(-1, shift_logits1.size(-1)),
+            #         "target": shift_labels1.view(-1)
+            #     },
+            #     inputs2={
+            #         "input": shift_logits2.view(-1, shift_logits2.size(-1)),
+            #         "target": shift_labels2.view(-1)
+            #     }
+            # )
             loss1, loss2 = self.task_compute_function(
-                F.cross_entropy,
+                self.model.model.loss_function,
                 inputs1={
-                    "input": shift_logits1.view(-1, shift_logits1.size(-1)),
-                    "target": shift_labels1.view(-1)
+                    "logits": logits1,
+                    "labels": labels,
+                    "vocab_size": self.model.config.vocab_size
                 },
                 inputs2={
-                    "input": shift_logits2.view(-1, shift_logits2.size(-1)),
-                    "target": shift_labels2.view(-1)
+                    "logits": logits2,
+                    "labels": labels,
+                    "vocab_size": self.model.config.vocab_size
                 }
-            )
+            )            
             
             return loss1, loss2
-        else:
-            # 如果没有标签，返回假的损失用于测试
-            dummy_loss1 = torch.tensor(0.0, device=logits1.device)
-            dummy_loss2 = torch.tensor(0.0, device=logits2.device)
-            return dummy_loss1, dummy_loss2
     
     def task_compute_decoder_layer(
         self,
@@ -349,8 +380,8 @@ class MixtralZO2Optimizer(MeZO2SGD):
         """
         计算单个decoder层，特别处理MoE部分
         """
-        # 这里需要手动实现decoder层的前向传播以支持双路径
-        # 由于MoE的复杂性，我们需要分解每个组件
+        # 手动实现decoder层的前向传播以支持双路径
+        # 由于MoE的复杂性，需要分解每个组件
         
         # 1. 输入层归一化
         normed_hidden_states1, normed_hidden_states2 = self.task_compute_module(
